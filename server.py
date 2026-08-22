@@ -9,16 +9,13 @@ from matcher import calculate_match
 import os
 
 
-
 # Load .env
 load_dotenv()
-
 
 
 app = FastAPI(
     title="StreetGO Dating Engine"
 )
-
 
 
 # =========================
@@ -29,13 +26,14 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "http://127.0.0.1:3000"
+        "http://127.0.0.1:3000",
+        "https://streetgo.app",
+        "https://www.streetgo.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 
 # =========================
@@ -46,32 +44,24 @@ SUPABASE_URL = os.getenv(
     "SUPABASE_URL"
 )
 
-
 SUPABASE_KEY = os.getenv(
     "SUPABASE_SERVICE_ROLE_KEY"
 )
-
-
 
 print("URL:", SUPABASE_URL)
 print("KEY:", bool(SUPABASE_KEY))
 
 
-
 if not SUPABASE_URL or not SUPABASE_KEY:
-
     raise Exception(
         "Missing Supabase keys"
     )
-
 
 
 supabase = create_client(
     SUPABASE_URL,
     SUPABASE_KEY
 )
-
-
 
 
 # =========================
@@ -85,9 +75,6 @@ def home():
         "status": "online",
         "service": "StreetGO Dating Engine"
     }
-
-
-
 
 
 # =========================
@@ -107,31 +94,18 @@ def test_profiles():
             .execute()
         )
 
-
         return {
-
             "success": True,
-
             "count": len(result.data),
-
             "profiles": result.data
-
         }
-
 
     except Exception as e:
 
-
         return {
-
             "success": False,
-
             "error": str(e)
-
         }
-
-
-
 
 
 # =========================
@@ -143,13 +117,9 @@ def dating_users():
 
     try:
 
-
         result = (
-
             supabase
-
             .table("profiles")
-
             .select(
                 """
                 id,
@@ -163,40 +133,24 @@ def dating_users():
                 dating_active
                 """
             )
-
             .eq(
                 "dating_active",
                 True
             )
-
             .execute()
-
         )
 
-
         return {
-
             "success": True,
-
             "users": result.data
-
         }
-
-
 
     except Exception as e:
 
-
         return {
-
             "success": False,
-
             "error": str(e)
-
         }
-
-
-
 
 
 # =========================
@@ -208,72 +162,45 @@ def get_matches(user_id: str):
 
     try:
 
-
         # Get active dating users
-
         response = (
-
             supabase
-
             .table("profiles")
-
             .select("*")
-
             .eq(
                 "dating_active",
                 True
             )
-
             .execute()
-
         )
-
 
         users = response.data
 
-
-
         current_user = None
-
-
 
         for user in users:
 
             if user["id"] == user_id:
 
                 current_user = user
-
                 break
-
-
 
         if not current_user:
 
-
             return {
-
                 "error": "User not found"
-
             }
-
-
 
         matches = []
 
-
-
         for person in users:
 
-
-
             if person["id"] != user_id:
-
 
                 result = calculate_match(
                     current_user,
                     person
                 )
-
 
                 matches.append({
 
@@ -294,14 +221,10 @@ def get_matches(user_id: str):
 
                 })
 
-
-
         matches.sort(
             key=lambda x: x["score"],
             reverse=True
         )
-
-
 
         return {
 
@@ -313,13 +236,8 @@ def get_matches(user_id: str):
 
         }
 
-
-
     except Exception as e:
 
-
         return {
-
             "error": str(e)
-
         }
