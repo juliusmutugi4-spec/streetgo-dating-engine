@@ -4,9 +4,16 @@ def calculate_match(user, person):
     reasons = []
 
 
-    # ==========================
-    # AGE COMPATIBILITY (20%)
-    # ==========================
+    mode = (
+        person.get("profile_mode")
+        or "dating"
+    ).lower()
+
+
+
+    # =====================================
+    # AGE COMPATIBILITY
+    # =====================================
 
     if user.get("age") and person.get("age"):
 
@@ -39,9 +46,9 @@ def calculate_match(user, person):
 
 
 
-    # ==========================
-    # INTERESTS (40%)
-    # ==========================
+    # =====================================
+    # SHARED INTERESTS
+    # =====================================
 
     user_interests = set(
         user.get("interests") or []
@@ -53,15 +60,19 @@ def calculate_match(user, person):
     )
 
 
-    shared = user_interests.intersection(
-        person_interests
+    shared_interests = (
+        user_interests
+        .intersection(
+            person_interests
+        )
     )
 
 
-    if shared:
+    if shared_interests:
+
 
         interest_score = min(
-            len(shared) * 25,
+            len(shared_interests) * 20,
             40
         )
 
@@ -70,62 +81,196 @@ def calculate_match(user, person):
 
 
         reasons.append(
-            f"Shared interests: {', '.join(shared)}"
+            "Shared interests: "
+            +
+            ", ".join(
+                shared_interests
+            )
         )
 
 
 
-    # ==========================
-    # PERSONALITY (20%)
-    # ==========================
+    # =====================================
+    # DATING MODE
+    # =====================================
 
-    if (
-        user.get("personality")
-        and
-        user.get("personality")
-        ==
-        person.get("personality")
-    ):
+    if mode == "dating":
 
-        score += 20
 
-        reasons.append(
-            "Similar personality"
+        if (
+            user.get("personality")
+            and
+            user.get("personality")
+            ==
+            person.get("personality")
+        ):
+
+            score += 20
+
+            reasons.append(
+                "Similar personality"
+            )
+
+
+
+        if (
+            user.get("looking_for")
+            and
+            user.get("looking_for")
+            ==
+            person.get("looking_for")
+        ):
+
+            score += 10
+
+            reasons.append(
+                "Same relationship goal"
+            )
+
+
+
+
+    # =====================================
+    # BUSINESS MODE
+    # =====================================
+
+    elif mode == "business":
+
+
+        user_skills = set(
+            user.get("skills") or []
         )
 
 
-
-    # ==========================
-    # RELATIONSHIP GOAL (10%)
-    # ==========================
-
-    if (
-        user.get("looking_for")
-        ==
-        person.get("looking_for")
-    ):
-
-        score += 10
-
-        reasons.append(
-            "Same relationship goal"
+        person_skills = set(
+            person.get("skills") or []
         )
 
 
+        shared_skills = (
+            user_skills
+            .intersection(
+                person_skills
+            )
+        )
 
-    # ==========================
-    # REPUTATION / TRUST (10%)
-    # ==========================
 
-    reputation = person.get(
-        "reputation",
-        0
+        if shared_skills:
+
+
+            score += 30
+
+
+            reasons.append(
+                "Shared skills: "
+                +
+                ", ".join(
+                    shared_skills
+                )
+            )
+
+
+
+        if (
+            user.get("profession")
+            and
+            user.get("profession")
+            ==
+            person.get("profession")
+        ):
+
+
+            score += 20
+
+
+            reasons.append(
+                "Similar profession"
+            )
+
+
+
+
+    # =====================================
+    # JOB MODE
+    # =====================================
+
+    elif mode == "job":
+
+
+        user_skills = set(
+            user.get("skills") or []
+        )
+
+
+        person_skills = set(
+            person.get("skills") or []
+        )
+
+
+        matching_skills = (
+            user_skills
+            .intersection(
+                person_skills
+            )
+        )
+
+
+        if matching_skills:
+
+
+            score += 40
+
+
+            reasons.append(
+                "Matching skills: "
+                +
+                ", ".join(
+                    matching_skills
+                )
+            )
+
+
+
+        if person.get("experience"):
+
+
+            score += 10
+
+
+            reasons.append(
+                "Professional experience available"
+            )
+
+
+
+        if person.get("education"):
+
+
+            score += 10
+
+
+            reasons.append(
+                "Education profile completed"
+            )
+
+
+
+
+    # =====================================
+    # TRUST SCORE
+    # =====================================
+
+    reputation = (
+        person.get("reputation")
+        or 0
     )
 
 
     if reputation >= 20:
 
+
         score += 10
+
 
         reasons.append(
             "Trusted StreetGO user"
@@ -134,52 +279,100 @@ def calculate_match(user, person):
 
     elif reputation > 0:
 
+
         score += 5
 
 
 
-    # ==========================
-    # PROFILE COMPLETENESS BONUS
-    # ==========================
 
-    complete_fields = 0
+    # =====================================
+    # PROFILE COMPLETION
+    # =====================================
 
+    required_fields = [
 
-    for field in [
         "age",
         "gender",
         "interests",
-        "personality",
-        "looking_for"
-    ]:
+        "profile_mode"
+
+    ]
+
+
+    completed = 0
+
+
+    for field in required_fields:
+
 
         if person.get(field):
 
-            complete_fields += 1
+            completed += 1
 
 
 
-    if complete_fields == 5:
+    if completed == len(required_fields):
+
 
         score += 10
 
+
         reasons.append(
-            "Complete dating profile"
+            "Complete StreetGO profile"
         )
 
 
 
-    # ==========================
-    # FINAL RESULT
-    # ==========================
+
+    # =====================================
+    # MODE LABEL
+    # =====================================
+
+
+    if mode == "dating":
+
+
+        reasons.insert(
+            0,
+            "❤️ Dating compatibility"
+        )
+
+
+    elif mode == "business":
+
+
+        reasons.insert(
+            0,
+            "💼 Business networking match"
+        )
+
+
+    elif mode == "job":
+
+
+        reasons.insert(
+            0,
+            "🎯 Career opportunity match"
+        )
+
+
+
 
     return {
 
-        "match_score": min(
-            score,
-            100
-        ),
 
-        "reasons": reasons
+        "match_score":
+            min(
+                score,
+                100
+            ),
+
+
+        "reasons":
+            reasons,
+
+
+        "profile_mode":
+            mode
 
     }
