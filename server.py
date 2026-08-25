@@ -5,40 +5,88 @@ from supabase import create_client
 from dotenv import load_dotenv
 
 from matcher import calculate_match
+from live.routes import router as live_router
+from live.webrtc import router as webrtc_router
 
 import os
 
 
-# Load .env
+# =========================================================
+# ENV
+# =========================================================
+
 load_dotenv()
 
+
+# =========================================================
+# FASTAPI
+# =========================================================
 
 app = FastAPI(
     title="StreetGO Dating Engine"
 )
 
 
-# =========================
+# =========================================================
+# ROUTERS
+# =========================================================
+
+app.include_router(live_router)
+app.include_router(webrtc_router)
+
+
+# =========================================================
 # CORS
-# =========================
+# =========================================================
+# =========================================================
+# CORS
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
+
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+
+        # Production
         "https://streetgo.app",
         "https://www.streetgo.app",
     ],
+
     allow_credentials=True,
+
     allow_methods=["*"],
+
     allow_headers=["*"],
+
+    expose_headers=["*"],
 )
 
 
-# =========================
-# SUPABASE CONNECTION
-# =========================
+@app.middleware("http")
+async def debug_requests(request, call_next):
+
+    print(
+        "REQUEST:",
+        request.method,
+        request.url.path
+    )
+
+    response = await call_next(request)
+
+    print(
+        "RESPONSE:",
+        response.status_code
+    )
+
+    return response
+
+
+
+# =========================================================
+# SUPABASE
+# =========================================================
 
 SUPABASE_URL = os.getenv(
     "SUPABASE_URL"
@@ -48,8 +96,16 @@ SUPABASE_KEY = os.getenv(
     "SUPABASE_SERVICE_ROLE_KEY"
 )
 
-print("URL:", SUPABASE_URL)
-print("KEY:", bool(SUPABASE_KEY))
+
+print(
+    "URL:",
+    SUPABASE_URL
+)
+
+print(
+    "KEY:",
+    bool(SUPABASE_KEY)
+)
 
 
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -64,22 +120,22 @@ supabase = create_client(
 )
 
 
-# =========================
+# =========================================================
 # HOME
-# =========================
+# =========================================================
 
 @app.get("/")
 def home():
 
     return {
         "status": "online",
-        "service": "StreetGO Dating Engine"
+        "service": "StreetGO Dating Engine",
     }
 
 
-# =========================
+# =========================================================
 # TEST PROFILES
-# =========================
+# =========================================================
 
 @app.get("/test-profiles")
 def test_profiles():
@@ -97,20 +153,20 @@ def test_profiles():
         return {
             "success": True,
             "count": len(result.data),
-            "profiles": result.data
+            "profiles": result.data,
         }
 
     except Exception as e:
 
         return {
             "success": False,
-            "error": str(e)
+            "error": str(e),
         }
 
 
-# =========================
+# =========================================================
 # DATING USERS
-# =========================
+# =========================================================
 
 @app.get("/dating-users")
 def dating_users():
@@ -124,13 +180,21 @@ def dating_users():
                 """
                 id,
                 username,
+                avatar_url,
                 age,
                 gender,
                 interests,
                 personality,
                 looking_for,
                 reputation,
-                dating_active
+                dating_active,
+                profile_mode,
+                headline,
+                profession,
+                skills,
+                experience,
+                education,
+                location
                 """
             )
             .eq(
@@ -142,27 +206,28 @@ def dating_users():
 
         return {
             "success": True,
-            "users": result.data
+            "users": result.data,
         }
 
     except Exception as e:
 
         return {
             "success": False,
-            "error": str(e)
+            "error": str(e),
         }
 
 
-# =========================
+# =========================================================
 # MATCH ENGINE
-# =========================
+# =========================================================
 
 @app.get("/matches/{user_id}")
-def get_matches(user_id: str):
+def get_matches(
+    user_id: str
+):
 
     try:
 
-        # Get active dating users
         response = (
             supabase
             .table("profiles")
@@ -183,6 +248,7 @@ def get_matches(user_id: str):
             if user["id"] == user_id:
 
                 current_user = user
+
                 break
 
         if not current_user:
@@ -215,10 +281,61 @@ def get_matches(user_id: str):
                         "avatar_url"
                     ),
 
-                    "score": result["match_score"],
+                    # =====================================
+                    # STREETGO PROFILE DATA
+                    # =====================================
 
-                    "reasons": result["reasons"]
+                    "profileType": (
+                        person.get(
+                            "profile_mode",
+                            "dating"
+                        ).capitalize()
+                    ),
 
+                    "headline": (
+                        person.get(
+                            "headline"
+                        )
+                        or
+                        "Building meaningful connections"
+                    ),
+
+                    "profession": person.get(
+                        "profession"
+                    ),
+
+                    "skills": person.get(
+                        "skills",
+                        []
+                    ),
+
+                    "experience": person.get(
+                        "experience"
+                    ),
+
+                    "education": person.get(
+                        "education"
+                    ),
+
+                    "location": (
+                        person.get(
+                            "location"
+                        )
+                        or
+                        "Nairobi, Kenya"
+                    ),
+
+                    # =====================================
+                    # MATCH RESULT
+                    # =====================================
+
+                    "score": result[
+                        "match_score"
+                    ],
+
+                    "reasons": result[
+                        "reasons"
+                    ],
                 })
 
         matches.sort(
@@ -232,8 +349,7 @@ def get_matches(user_id: str):
                 "username"
             ),
 
-            "matches": matches
-
+            "matches": matches,
         }
 
     except Exception as e:
