@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import os
 
 import httpx
@@ -767,7 +767,6 @@ async def create_offer(
         # -------------------------------------------------
         # VIDEO
         # -------------------------------------------------
-
         if track.kind == "video":
 
             broadcast_tracks[
@@ -779,6 +778,88 @@ async def create_offer(
                 offer.live_id,
                 track.id,
             )
+
+            async def verify_video_frames():
+
+                try:
+
+                    probe = relay.subscribe(
+                        track,
+                        buffered=False,
+                    )
+
+                    frame = await asyncio.wait_for(
+                        probe.recv(),
+                        timeout=5.0,
+                    )
+
+                    print(
+                        "========================================"
+                    )
+
+                    print(
+                        "STREETGO VIDEO FRAME RECEIVED"
+                    )
+
+                    print(
+                        "LIVE:",
+                        offer.live_id,
+                    )
+
+                    print(
+                        "TRACK:",
+                        track.id,
+                    )
+
+                    print(
+                        "FRAME:",
+                        type(frame).__name__,
+                    )
+
+                    print(
+                        "FRAME SIZE:",
+                        getattr(frame, "width", None),
+                        "x",
+                        getattr(frame, "height", None),
+                    )
+
+                    print(
+                        "========================================"
+                    )
+
+                except Exception as exc:
+
+                    print(
+                        "========================================"
+                    )
+
+                    print(
+                        "STREETGO VIDEO FRAME TEST FAILED"
+                    )
+
+                    print(
+                        "LIVE:",
+                        offer.live_id,
+                    )
+
+                    print(
+                        "TRACK:",
+                        track.id,
+                    )
+
+                    print(
+                        "ERROR:",
+                        repr(exc),
+                    )
+
+                    print(
+                        "========================================"
+                    )
+
+            asyncio.create_task(
+                verify_video_frames()
+            )
+
 
         # -------------------------------------------------
         # AUDIO
