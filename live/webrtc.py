@@ -840,30 +840,16 @@ async def create_offer(
                 except Exception as exc:
 
                     print(
-                        "========================================"
-                    )
-
-                    print(
-                        "STREETGO VIDEO FRAME TEST FAILED"
-                    )
-
-                    print(
-                        "LIVE:",
+                        "STREETGO VIDEO FRAME TEST FAILED:",
+                        "LIVE=",
                         offer.live_id,
-                    )
-
-                    print(
-                        "TRACK:",
+                        "TRACK=",
                         track.id,
-                    )
-
-                    print(
-                        "ERROR:",
+                        "ERROR_TYPE=",
+                        type(exc).__name__,
+                        "ERROR=",
                         repr(exc),
-                    )
-
-                    print(
-                        "========================================"
+                        flush=True,
                     )
 
             asyncio.create_task(
