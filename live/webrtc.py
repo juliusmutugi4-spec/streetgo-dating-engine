@@ -793,6 +793,50 @@ async def create_offer(
 
                 try:
 
+                    print(
+                        "STREETGO VIDEO FRAME TEST WAITING FOR CONNECTION:",
+                        offer.live_id,
+                        track.id,
+                        flush=True,
+                    )
+
+                    started = (
+                        asyncio.get_running_loop().time()
+                    )
+
+                    while pc.connectionState not in {
+                        "connected",
+                        "failed",
+                        "closed",
+                    }:
+
+                        elapsed = (
+                            asyncio.get_running_loop().time()
+                            - started
+                        )
+
+                        if elapsed >= 15.0:
+                            raise TimeoutError(
+                                "WebRTC connection did not reach connected state"
+                            )
+
+                        await asyncio.sleep(0.25)
+
+                    print(
+                        "STREETGO VIDEO FRAME TEST CONNECTION STATE:",
+                        pc.connectionState,
+                        "LIVE=",
+                        offer.live_id,
+                        "TRACK=",
+                        track.id,
+                        flush=True,
+                    )
+
+                    if pc.connectionState != "connected":
+                        raise RuntimeError(
+                            f"WebRTC connection state is {pc.connectionState}"
+                        )
+
                     probe = relay.subscribe(
                         track,
                         buffered=False,
@@ -800,7 +844,7 @@ async def create_offer(
 
                     frame = await asyncio.wait_for(
                         probe.recv(),
-                        timeout=5.0,
+                        timeout=10.0,
                     )
 
                     print(
@@ -1136,4 +1180,3 @@ async def create_offer(
                 f"{exc}"
             ),
         )
-
