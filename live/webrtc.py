@@ -1,4 +1,8 @@
 import asyncio
+import os
+
+import httpx
+from dotenv import load_dotenv
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -6,11 +10,13 @@ from pydantic import BaseModel
 from aiortc import (
     RTCPeerConnection,
     RTCSessionDescription,
+    RTCIceServer,
+    RTCConfiguration,
 )
 
 from aiortc.contrib.media import MediaRelay
 
-
+load_dotenv()
 # =========================================================
 # ROUTER
 # =========================================================
@@ -463,6 +469,41 @@ async def cleanup_peer(
 # CREATE WEBRTC OFFER
 # =========================================================
 
+
+
+async def get_cloudflare_ice_servers():
+    key_id = os.getenv("CLOUDFLARE_TURN_KEY_ID")
+    api_token = os.getenv("CLOUDFLARE_TURN_API_TOKEN")
+
+    if not key_id or not api_token:
+        raise RuntimeError(
+            "Cloudflare TURN credentials are not configured"
+        )
+
+    url = (
+        "https://rtc.live.cloudflare.com/v1/turn/keys/"
+        f"{key_id}/credentials/generate-ice-servers"
+    )
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "ttl": 86400,
+            },
+        )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    return result["iceServers"]
+
+
 @router.post("/offer")
 async def create_offer(
     offer: WebRTCOffer,
@@ -510,7 +551,20 @@ async def create_offer(
     # CREATE PEER CONNECTION
     # =====================================================
 
-    pc = RTCPeerConnection()
+    ice_servers = await get_cloudflare_ice_servers()
+
+    pc = RTCPeerConnection(
+        RTCConfiguration(
+            iceServers=[
+                RTCIceServer(
+                    urls=server["urls"],
+                    username=server.get("username"),
+                    credential=server.get("credential"),
+                )
+                for server in ice_servers
+            ]
+        )
+    )
 
     peers = get_live_peers(
         offer.live_id
