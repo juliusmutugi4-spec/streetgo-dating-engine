@@ -575,19 +575,29 @@ async def create_offer(
     # CREATE PEER CONNECTION
     # =====================================================
 
-    ice_servers = await get_cloudflare_ice_servers()
+    # -----------------------------------------------------
+    # BACKEND ICE
+    #
+    # Cloudflare TURN credentials are intentionally used by
+    # browser clients through /ice-servers.
+    #
+    # The Render/aiortc peer does NOT use Cloudflare TURN.
+    # This avoids the aioice TURN ChannelBind failure seen
+    # in production.
+    # -----------------------------------------------------
 
     pc = RTCPeerConnection(
         RTCConfiguration(
             iceServers=[
                 RTCIceServer(
-                    urls=server["urls"],
-                    username=server.get("username"),
-                    credential=server.get("credential"),
-                )
-                for server in ice_servers
+                    urls="stun:stun.cloudflare.com:3478",
+                ),
             ]
         )
+    )
+
+    print(
+        "STREETGO BACKEND ICE: Cloudflare TURN disabled"
     )
 
     peers = get_live_peers(
