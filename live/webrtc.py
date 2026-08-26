@@ -875,7 +875,8 @@ async def create_offer(
 
                 pc.addTrack(
                     relay.subscribe(
-                        video_track
+                        video_track,
+                        buffered=False,
                     )
                 )
 
@@ -903,7 +904,8 @@ async def create_offer(
 
                 pc.addTrack(
                     relay.subscribe(
-                        audio_track
+                        audio_track,
+                        buffered=False,
                     )
                 )
 
@@ -1057,3 +1059,4 @@ async def create_offer(
                 f"{exc}"
             ),
         )
+
