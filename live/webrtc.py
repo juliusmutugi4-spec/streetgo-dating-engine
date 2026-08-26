@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import os
 
 import httpx
@@ -503,6 +503,30 @@ async def get_cloudflare_ice_servers():
 
     return result["iceServers"]
 
+
+@router.get("/ice-servers")
+async def get_ice_servers():
+    """
+    Return temporary Cloudflare TURN/STUN credentials
+    for browser WebRTC clients.
+
+    The Cloudflare API token remains server-side.
+    """
+    try:
+        return {
+            "iceServers": await get_cloudflare_ice_servers()
+        }
+
+    except Exception as exc:
+        print(
+            "Cloudflare ICE server generation failed:",
+            repr(exc)
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to generate WebRTC ICE servers",
+        )
 
 @router.post("/offer")
 async def create_offer(
