@@ -46,9 +46,12 @@ class CreateLiveRequest(BaseModel):
 # =========================================================
 
 @router.post("/create")
-def create_live(request: CreateLiveRequest):
-
-    live_id = f"live_{uuid4().hex[:12]}"
+def create_live(
+    request: CreateLiveRequest,
+):
+    live_id = (
+        f"live_{uuid4().hex[:12]}"
+    )
 
     session = LiveSession(
         live_id=live_id,
@@ -61,6 +64,14 @@ def create_live(request: CreateLiveRequest):
     )
 
     live_sessions[live_id] = session
+
+    print(
+        "STREETGO LIVE CREATED:",
+        live_id,
+        "HOST:",
+        request.host_id,
+        flush=True,
+    )
 
     return {
         "success": True,
@@ -135,10 +146,11 @@ def start_live(
 
     if session.status == "live":
 
-        raise HTTPException(
-            status_code=400,
-            detail="Live session is already live",
-        )
+        return {
+            "success": True,
+            "message": "Live session already live",
+            "live": session,
+        }
 
     if session.status == "ended":
 
@@ -151,6 +163,12 @@ def start_live(
 
     session.started_at = (
         datetime.now(timezone.utc)
+    )
+
+    print(
+        "STREETGO LIVE STARTED:",
+        live_id,
+        flush=True,
     )
 
     return {
@@ -182,15 +200,25 @@ def stop_live(
 
     if session.status != "live":
 
-        raise HTTPException(
-            status_code=400,
-            detail="Live session is not currently live",
-        )
+        return {
+            "success": True,
+            "message": "Live session is already stopped",
+            "live": session,
+        }
 
     session.status = "ended"
 
     session.ended_at = (
         datetime.now(timezone.utc)
+    )
+
+    # Reset viewer count.
+    session.viewer_count = 0
+
+    print(
+        "STREETGO LIVE STOPPED:",
+        live_id,
+        flush=True,
     )
 
     return {
@@ -203,25 +231,113 @@ def stop_live(
 # =========================================================
 # LIVE WEBSOCKET
 #
-# IMPORTANT:
-#
 # Broadcaster:
 # /live/{live_id}/ws?role=broadcaster
 #
 # Viewer:
 # /live/{live_id}/ws?role=viewer
 #
-# The broadcaster is NOT counted as a viewer.
+# IMPORTANT:
+# Accept the WebSocket FIRST.
+# Then validate the session.
+#
+# This prevents a missing/stale live_id from becoming
+# an HTTP 403 handshake failure.
 # =========================================================
 
-@router.websocket("/{live_id}/ws")
+@router.websocket(
+    "/{live_id}/ws"
+)
 async def live_websocket(
     websocket: WebSocket,
     live_id: str,
 ):
 
+    role = websocket.query_params.get(
+        "role",
+        "viewer",
+    )
+
+    if role not in {
+        "broadcaster",
+        "viewer",
+    }:
+        role = "viewer"
+
+    print(
+        "================================================",
+        flush=True,
+    )
+
+    print(
+        "STREETGO WS REQUEST:",
+        flush=True,
+    )
+
+    print(
+        "LIVE ID:",
+        live_id,
+        flush=True,
+    )
+
+    print(
+        "ROLE:",
+        role,
+        flush=True,
+    )
+
+    print(
+        "ORIGIN:",
+        websocket.headers.get("origin"),
+        flush=True,
+    )
+
+    print(
+        "HOST:",
+        websocket.headers.get("host"),
+        flush=True,
+    )
+
+    print(
+        "USER AGENT:",
+        websocket.headers.get(
+            "user-agent"
+        ),
+        flush=True,
+    )
+
+    print(
+        "================================================",
+        flush=True,
+    )
+
     # =====================================================
-    # FIND LIVE SESSION
+    # ACCEPT HANDSHAKE FIRST
+    # =====================================================
+
+    try:
+
+        await websocket.accept()
+
+    except Exception as exc:
+
+        print(
+            "STREETGO WS ACCEPT ERROR:",
+            repr(exc),
+            flush=True,
+        )
+
+        return
+
+    print(
+        "STREETGO WS HANDSHAKE ACCEPTED:",
+        live_id,
+        role,
+        flush=True,
+    )
+
+    # =====================================================
+    # FIND SESSION AFTER ACCEPT
     # =====================================================
 
     session = live_sessions.get(
@@ -230,89 +346,127 @@ async def live_websocket(
 
     if not session:
 
-        await websocket.close(
-            code=1008
+        print(
+            "STREETGO WS SESSION NOT FOUND:",
+            live_id,
+            flush=True,
         )
+
+        try:
+
+            await websocket.send_json(
+                {
+                    "type":
+                        "error",
+
+                    "live_id":
+                        live_id,
+
+                    "message":
+                        "Live session not found.",
+                }
+            )
+
+        except Exception:
+            pass
+
+        try:
+
+            await websocket.close(
+                code=1008,
+                reason=
+                    "Live session not found",
+            )
+
+        except Exception:
+            pass
 
         return
 
     # =====================================================
-    # GET CONNECTION ROLE
+    # CONNECT MANAGER
     # =====================================================
 
-    role = websocket.query_params.get(
-        "role",
-        "viewer",
-    )
-
-    # =====================================================
-    # VALIDATE ROLE
-    # =====================================================
-
-    if role not in {
-        "broadcaster",
-        "viewer",
-    }:
-
-        role = "viewer"
-
-    # =====================================================
-    # CONNECT
-    # =====================================================
-
-    await manager.connect(
-        live_id,
-        websocket,
-        role,
-    )
-
-    # =====================================================
-    # UPDATE VIEWER COUNT
-    #
-    # Broadcaster is excluded automatically.
-    # =====================================================
-
-    session.viewer_count = (
-        manager.viewer_count(
-            live_id
-        )
-    )
-
-    # =====================================================
-    # BROADCAST NEW VIEWER COUNT
-    # =====================================================
-
-    await manager.broadcast(
-        live_id,
-        {
-            "type": "viewer_count",
-            "live_id": live_id,
-            "viewer_count": (
-                session.viewer_count
-            ),
-        },
-    )
+    connected_to_manager = False
 
     try:
 
+        await manager.connect(
+            live_id,
+            websocket,
+            role,
+        )
+
+        connected_to_manager = True
+
+        print(
+            "STREETGO WS CONNECTED:",
+            live_id,
+            "ROLE:",
+            role,
+            flush=True,
+        )
+
         # =================================================
-        # TELL CLIENT IT IS CONNECTED
+        # UPDATE VIEWER COUNT
+        # =================================================
+
+        session.viewer_count = (
+            manager.viewer_count(
+                live_id
+            )
+        )
+
+        print(
+            "STREETGO VIEWER COUNT:",
+            live_id,
+            session.viewer_count,
+            flush=True,
+        )
+
+        # =================================================
+        # BROADCAST VIEWER COUNT
+        # =================================================
+
+        await manager.broadcast(
+            live_id,
+            {
+                "type":
+                    "viewer_count",
+
+                "live_id":
+                    live_id,
+
+                "viewer_count":
+                    session.viewer_count,
+            },
+        )
+
+        # =================================================
+        # TELL CURRENT CLIENT CONNECTED
         # =================================================
 
         await websocket.send_json(
             {
-                "type": "connected",
-                "live_id": live_id,
-                "status": session.status,
-                "role": role,
-                "viewer_count": (
-                    session.viewer_count
-                ),
+                "type":
+                    "connected",
+
+                "live_id":
+                    live_id,
+
+                "status":
+                    session.status,
+
+                "role":
+                    role,
+
+                "viewer_count":
+                    session.viewer_count,
             }
         )
 
         # =================================================
-        # KEEP SOCKET ALIVE
+        # MESSAGE LOOP
         # =================================================
 
         while True:
@@ -321,12 +475,30 @@ async def live_websocket(
                 await websocket.receive_json()
             )
 
+            if not isinstance(
+                message,
+                dict,
+            ):
+                continue
+
+            print(
+                "STREETGO WS MESSAGE:",
+                live_id,
+                role,
+                flush=True,
+            )
+
             await manager.broadcast(
                 live_id,
                 {
-                    "type": "message",
-                    "live_id": live_id,
-                    "data": message,
+                    "type":
+                        "message",
+
+                    "live_id":
+                        live_id,
+
+                    "data":
+                        message,
                 },
             )
 
@@ -336,65 +508,90 @@ async def live_websocket(
 
     except WebSocketDisconnect:
 
-        manager.disconnect(
+        print(
+            "STREETGO WS DISCONNECTED:",
             live_id,
-            websocket,
-        )
-
-        # -------------------------------------------------
-        # Recalculate viewers
-        # -------------------------------------------------
-
-        session.viewer_count = (
-            manager.viewer_count(
-                live_id
-            )
-        )
-
-        # -------------------------------------------------
-        # Notify remaining connections
-        # -------------------------------------------------
-
-        await manager.broadcast(
-            live_id,
-            {
-                "type": "viewer_count",
-                "live_id": live_id,
-                "viewer_count": (
-                    session.viewer_count
-                ),
-            },
+            role,
+            flush=True,
         )
 
     # =====================================================
     # UNEXPECTED ERROR
     # =====================================================
 
-    except Exception as e:
+    except Exception as exc:
 
         print(
-            "STREETGO WEBSOCKET ERROR:",
-            e,
+            "STREETGO WS ERROR:",
+            repr(exc),
+            flush=True,
         )
 
-        manager.disconnect(
-            live_id,
-            websocket,
+    # =====================================================
+    # CLEANUP
+    # =====================================================
+
+    finally:
+
+        if connected_to_manager:
+
+            try:
+
+                manager.disconnect(
+                    live_id,
+                    websocket,
+                )
+
+            except Exception as exc:
+
+                print(
+                    "STREETGO WS MANAGER DISCONNECT ERROR:",
+                    repr(exc),
+                    flush=True,
+                )
+
+        # The session may have been removed
+        # while this connection was active.
+
+        session = live_sessions.get(
+            live_id
         )
 
-        session.viewer_count = (
-            manager.viewer_count(
-                live_id
-            )
-        )
+        if session:
 
-        await manager.broadcast(
-            live_id,
-            {
-                "type": "viewer_count",
-                "live_id": live_id,
-                "viewer_count": (
-                    session.viewer_count
-                ),
-            },
-        )
+            try:
+
+                session.viewer_count = (
+                    manager.viewer_count(
+                        live_id
+                    )
+                )
+
+                print(
+                    "STREETGO WS FINAL VIEWER COUNT:",
+                    live_id,
+                    session.viewer_count,
+                    flush=True,
+                )
+
+                await manager.broadcast(
+                    live_id,
+                    {
+                        "type":
+                            "viewer_count",
+
+                        "live_id":
+                            live_id,
+
+                        "viewer_count":
+                            session.viewer_count,
+                    },
+                )
+
+            except Exception as exc:
+
+                print(
+                    "STREETGO WS FINAL BROADCAST ERROR:",
+                    repr(exc),
+                    flush=True,
+                )
