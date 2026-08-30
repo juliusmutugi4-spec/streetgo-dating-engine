@@ -1,5 +1,6 @@
-import asyncio
+﻿import asyncio
 import os
+import re
 
 import httpx
 from dotenv import load_dotenv
@@ -16,7 +17,10 @@ from aiortc import (
 
 from aiortc.contrib.media import MediaRelay
 
+
 load_dotenv()
+
+
 # =========================================================
 # ROUTER
 # =========================================================
@@ -66,9 +70,6 @@ broadcast_tracks: dict[
 
 # =========================================================
 # CLEANUP LOCKS
-#
-# Prevent multiple WebRTC/ICE cleanup callbacks from
-# fighting over the same live session.
 # =========================================================
 
 cleanup_locks: dict[
@@ -79,9 +80,6 @@ cleanup_locks: dict[
 
 # =========================================================
 # CLEANED PEERS
-#
-# Prevent cleanup_peer() from executing twice for the
-# same RTCPeerConnection.
 # =========================================================
 
 cleaned_peers: set[
@@ -90,17 +88,26 @@ cleaned_peers: set[
 
 
 # =========================================================
-# WEBRTC OFFER MODEL
+# DISCONNECT GRACE TIMERS
+#
+# A temporary WebRTC "disconnected" state should not
+# immediately destroy the peer or broadcaster media.
+# =========================================================
+
+disconnect_timers: dict[
+    RTCPeerConnection,
+    asyncio.Task,
+] = {}
+
+
+# =========================================================
+# OFFER MODEL
 # =========================================================
 
 class WebRTCOffer(BaseModel):
-
     live_id: str
-
     sdp: str
-
     type: str
-
     role: str
 
 
@@ -113,14 +120,9 @@ def get_cleanup_lock(
 ) -> asyncio.Lock:
 
     if live_id not in cleanup_locks:
+        cleanup_locks[live_id] = asyncio.Lock()
 
-        cleanup_locks[
-            live_id
-        ] = asyncio.Lock()
-
-    return cleanup_locks[
-        live_id
-    ]
+    return cleanup_locks[live_id]
 
 
 # =========================================================
@@ -131,31 +133,22 @@ def get_live_peers(
     live_id: str,
 ):
     if live_id not in peer_connections:
-
         peer_connections[live_id] = {
             "broadcaster": set(),
             "viewer": set(),
         }
 
-    else:
+    peer_connections[live_id].setdefault(
+        "broadcaster",
+        set(),
+    )
 
-        peer_connections[
-            live_id
-        ].setdefault(
-            "broadcaster",
-            set(),
-        )
+    peer_connections[live_id].setdefault(
+        "viewer",
+        set(),
+    )
 
-        peer_connections[
-            live_id
-        ].setdefault(
-            "viewer",
-            set(),
-        )
-
-    return peer_connections[
-        live_id
-    ]
+    return peer_connections[live_id]
 
 
 # =========================================================
@@ -201,7 +194,6 @@ def print_peer_counts(
     live_id: str,
     prefix: str = "STREETGO WEBRTC",
 ):
-
     broadcasters, viewers = (
         get_active_peer_counts(
             live_id
@@ -215,24 +207,63 @@ def print_peer_counts(
         broadcasters,
         "VIEWERS:",
         viewers,
+        flush=True,
     )
+
+
+# =========================================================
+# GET ACTIVE BROADCAST TRACK
+# =========================================================
+
+def get_active_broadcast_track(
+    live_id: str,
+    kind: str,
+):
+    tracks = broadcast_tracks.get(
+        live_id
+    )
+
+    if not tracks:
+        return None
+
+    track = tracks.get(
+        kind
+    )
+
+    if track is None:
+        return None
+
+    try:
+        ready_state = getattr(
+            track,
+            "readyState",
+            None,
+        )
+
+        if ready_state == "ended":
+            return None
+
+    except Exception:
+        pass
+
+    return track
 
 
 # =========================================================
 # WAIT FOR BROADCASTER MEDIA
 #
-# Viewer can arrive slightly before the broadcaster
-# tracks have been received by the backend.
+# The viewer must not get a successful SDP answer
+# before broadcaster video is actually available.
 # =========================================================
 
 async def wait_for_broadcast_tracks(
     live_id: str,
     timeout: float = 15.0,
 ):
-
     print(
         "STREETGO WAITING FOR BROADCASTER TRACKS:",
         live_id,
+        flush=True,
     )
 
     started = (
@@ -241,29 +272,24 @@ async def wait_for_broadcast_tracks(
 
     while True:
 
-        tracks = broadcast_tracks.get(
-            live_id
+        video_track = (
+            get_active_broadcast_track(
+                live_id,
+                "video",
+            )
         )
 
-        # -------------------------------------------------
-        # Video is the minimum requirement.
-        # -------------------------------------------------
-
-        if (
-            tracks
-            and tracks.get("video") is not None
-        ):
-
+        if video_track is not None:
             print(
                 "STREETGO BROADCASTER VIDEO READY:",
                 live_id,
+                flush=True,
             )
 
-            return tracks
-
-        # -------------------------------------------------
-        # Timeout
-        # -------------------------------------------------
+            return broadcast_tracks.get(
+                live_id,
+                {},
+            )
 
         elapsed = (
             asyncio.get_running_loop().time()
@@ -271,21 +297,112 @@ async def wait_for_broadcast_tracks(
         )
 
         if elapsed >= timeout:
-
             print(
                 "STREETGO BROADCASTER TRACK WAIT TIMEOUT:",
                 live_id,
+                flush=True,
             )
 
-            return tracks or {}
-
-        # -------------------------------------------------
-        # Wait briefly
-        # -------------------------------------------------
+            return {}
 
         await asyncio.sleep(
             0.1
         )
+
+
+# =========================================================
+# CANCEL DISCONNECT TIMER
+# =========================================================
+
+def cancel_disconnect_timer(
+    pc: RTCPeerConnection,
+):
+    task = disconnect_timers.pop(
+        pc,
+        None,
+    )
+
+    if task and not task.done():
+        task.cancel()
+
+
+# =========================================================
+# DELAYED DISCONNECT CLEANUP
+# =========================================================
+
+async def delayed_disconnect_cleanup(
+    live_id: str,
+    role: str,
+    pc: RTCPeerConnection,
+    delay: float = 10.0,
+):
+    try:
+        await asyncio.sleep(
+            delay
+        )
+
+        if pc in cleaned_peers:
+            return
+
+        if pc.connectionState in {
+            "connected",
+            "connecting",
+        }:
+            return
+
+        if pc.connectionState in {
+            "disconnected",
+            "failed",
+            "closed",
+        }:
+            await cleanup_peer(
+                live_id,
+                role,
+                pc,
+            )
+
+    except asyncio.CancelledError:
+        return
+
+    except Exception as exc:
+        print(
+            "STREETGO DELAYED CLEANUP ERROR:",
+            repr(exc),
+            flush=True,
+        )
+
+    finally:
+        disconnect_timers.pop(
+            pc,
+            None,
+        )
+
+
+# =========================================================
+# SCHEDULE DISCONNECT CLEANUP
+# =========================================================
+
+def schedule_disconnect_cleanup(
+    live_id: str,
+    role: str,
+    pc: RTCPeerConnection,
+):
+    cancel_disconnect_timer(
+        pc
+    )
+
+    task = asyncio.create_task(
+        delayed_disconnect_cleanup(
+            live_id,
+            role,
+            pc,
+            10.0,
+        )
+    )
+
+    disconnect_timers[
+        pc
+    ] = task
 
 
 # =========================================================
@@ -297,15 +414,16 @@ async def cleanup_peer(
     role: str,
     pc: RTCPeerConnection,
 ):
-
-    # -----------------------------------------------------
-    # Prevent duplicate cleanup.
-    # -----------------------------------------------------
-
     if pc in cleaned_peers:
         return
 
-    cleaned_peers.add(pc)
+    cleaned_peers.add(
+        pc
+    )
+
+    cancel_disconnect_timer(
+        pc
+    )
 
     lock = get_cleanup_lock(
         live_id
@@ -314,46 +432,40 @@ async def cleanup_peer(
     async with lock:
 
         print(
-            "========================================"
+            "========================================",
+            flush=True,
         )
 
         print(
-            "STREETGO WEBRTC CLEANUP START"
+            "STREETGO WEBRTC CLEANUP START",
+            flush=True,
         )
 
         print(
             "LIVE ID:",
             live_id,
+            flush=True,
         )
 
         print(
             "ROLE:",
             role,
+            flush=True,
         )
-
-        # -------------------------------------------------
-        # Remove peer from its role set.
-        # -------------------------------------------------
 
         peers = peer_connections.get(
             live_id
         )
 
         if peers:
-
             role_peers = peers.get(
                 role
             )
 
             if role_peers is not None:
-
                 role_peers.discard(
                     pc
                 )
-
-        # -------------------------------------------------
-        # Close the peer connection.
-        # -------------------------------------------------
 
         try:
 
@@ -361,19 +473,14 @@ async def cleanup_peer(
                 pc.connectionState
                 != "closed"
             ):
-
                 await pc.close()
 
         except Exception as exc:
-
             print(
                 "STREETGO WEBRTC CLOSE ERROR:",
-                exc,
+                repr(exc),
+                flush=True,
             )
-
-        # -------------------------------------------------
-        # Check remaining peers.
-        # -------------------------------------------------
 
         peers = peer_connections.get(
             live_id
@@ -381,53 +488,47 @@ async def cleanup_peer(
 
         if peers:
 
-            broadcaster_peers = peers.get(
-                "broadcaster",
-                set(),
+            broadcaster_peers = (
+                peers.get(
+                    "broadcaster",
+                    set(),
+                )
             )
 
-            viewer_peers = peers.get(
-                "viewer",
-                set(),
+            viewer_peers = (
+                peers.get(
+                    "viewer",
+                    set(),
+                )
             )
 
             print(
                 "STREETGO WEBRTC AFTER CLEANUP:",
                 "BROADCASTERS:",
-                len(
-                    broadcaster_peers
-                ),
+                len(broadcaster_peers),
                 "VIEWERS:",
-                len(
-                    viewer_peers
-                ),
+                len(viewer_peers),
+                flush=True,
             )
 
-            # -------------------------------------------------
-            # If broadcaster is gone, the broadcast media
-            # should no longer be available.
-            #
-            # This also protects against a viewer reconnecting
-            # to an old broadcaster track.
-            # -------------------------------------------------
+            # If no broadcaster peer remains,
+            # its media is no longer valid.
 
             if not broadcaster_peers:
 
-                if live_id in broadcast_tracks:
+                broadcast_tracks.pop(
+                    live_id,
+                    None,
+                )
 
-                    broadcast_tracks.pop(
-                        live_id,
-                        None,
-                    )
+                print(
+                    "STREETGO BROADCAST TRACKS REMOVED:",
+                    live_id,
+                    flush=True,
+                )
 
-                    print(
-                        "STREETGO BROADCAST TRACKS REMOVED:",
-                        live_id,
-                    )
-
-            # -------------------------------------------------
-            # Nobody connected anymore.
-            # -------------------------------------------------
+            # If nobody remains at all,
+            # remove the complete live state.
 
             if (
                 not broadcaster_peers
@@ -452,30 +553,39 @@ async def cleanup_peer(
                 print(
                     "STREETGO WEBRTC LIVE MEDIA CLEANED:",
                     live_id,
+                    flush=True,
                 )
 
         print(
             "STREETGO WEBRTC PEER CLEANED:",
             live_id,
             role,
+            flush=True,
         )
 
         print(
-            "========================================"
+            "========================================",
+            flush=True,
         )
 
 
 # =========================================================
-# CREATE WEBRTC OFFER
+# CLOUDFLARE ICE SERVERS
 # =========================================================
 
-
-
 async def get_cloudflare_ice_servers():
-    key_id = os.getenv("CLOUDFLARE_TURN_KEY_ID")
-    api_token = os.getenv("CLOUDFLARE_TURN_API_TOKEN")
+    key_id = os.getenv(
+        "CLOUDFLARE_TURN_KEY_ID"
+    )
 
-    if not key_id or not api_token:
+    api_token = os.getenv(
+        "CLOUDFLARE_TURN_API_TOKEN"
+    )
+
+    if (
+        not key_id
+        or not api_token
+    ):
         raise RuntimeError(
             "Cloudflare TURN credentials are not configured"
         )
@@ -485,15 +595,22 @@ async def get_cloudflare_ice_servers():
         f"{key_id}/credentials/generate-ice-servers"
     )
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(
+        timeout=10.0
+    ) as client:
+
         response = await client.post(
             url,
             headers={
-                "Authorization": f"Bearer {api_token}",
-                "Content-Type": "application/json",
+                "Authorization":
+                    f"Bearer {api_token}",
+
+                "Content-Type":
+                    "application/json",
             },
             json={
-                "ttl": 86400,
+                "ttl":
+                    86400,
             },
         )
 
@@ -501,428 +618,451 @@ async def get_cloudflare_ice_servers():
 
     result = response.json()
 
-    return result["iceServers"]
+    return result[
+        "iceServers"
+    ]
 
 
-@router.get("/ice-servers")
+# =========================================================
+# GET ICE SERVERS
+# =========================================================
+
+@router.get(
+    "/ice-servers"
+)
 async def get_ice_servers():
-    """
-    Return temporary Cloudflare TURN/STUN credentials
-    for browser WebRTC clients.
 
-    The Cloudflare API token remains server-side.
-    """
     try:
+
         return {
-            "iceServers": await get_cloudflare_ice_servers()
+            "iceServers":
+                await get_cloudflare_ice_servers()
         }
 
     except Exception as exc:
+
         print(
             "Cloudflare ICE server generation failed:",
-            repr(exc)
+            repr(exc),
+            flush=True,
         )
 
         raise HTTPException(
             status_code=502,
-            detail="Unable to generate WebRTC ICE servers",
+            detail=
+                "Unable to generate WebRTC ICE servers",
         )
 
-@router.post("/offer")
+
+# =========================================================
+# SDP MEDIA DIRECTION
+# =========================================================
+
+def get_media_direction(
+    sdp: str,
+    media_kind: str,
+) -> str | None:
+
+    sections = re.split(
+        r"(?=m=)",
+        sdp,
+    )
+
+    for section in sections:
+
+        if not section.startswith(
+            f"m={media_kind} "
+        ):
+            continue
+
+        for direction in (
+            "sendrecv",
+            "sendonly",
+            "recvonly",
+            "inactive",
+        ):
+
+            if (
+                f"a={direction}"
+                in section
+            ):
+                return direction
+
+    return None
+
+
+# =========================================================
+# WAIT FOR BACKEND ICE GATHERING
+# =========================================================
+
+async def wait_for_ice_gathering_complete(
+    pc: RTCPeerConnection,
+    timeout: float = 10.0,
+):
+
+    if (
+        pc.iceGatheringState
+        == "complete"
+    ):
+        return
+
+    started = (
+        asyncio.get_running_loop().time()
+    )
+
+    while (
+        pc.iceGatheringState
+        != "complete"
+    ):
+
+        elapsed = (
+            asyncio.get_running_loop().time()
+            - started
+        )
+
+        if elapsed >= timeout:
+
+            print(
+                "STREETGO BACKEND ICE GATHERING TIMEOUT:",
+                pc.iceGatheringState,
+                flush=True,
+            )
+
+            return
+
+        await asyncio.sleep(
+            0.05
+        )
+
+
+# =========================================================
+# CREATE WEBRTC OFFER / ANSWER
+# =========================================================
+
+@router.post(
+    "/offer"
+)
 async def create_offer(
     offer: WebRTCOffer,
 ):
 
-    # =====================================================
-    # VALIDATION
-    # =====================================================
-
-    if not offer.live_id:
-
-        raise HTTPException(
-            status_code=400,
-            detail="live_id is required",
-        )
-
-    if not offer.sdp:
-
-        raise HTTPException(
-            status_code=400,
-            detail="SDP is required",
-        )
-
-    if offer.type != "offer":
-
-        raise HTTPException(
-            status_code=400,
-            detail="Expected WebRTC offer",
-        )
-
-    if offer.role not in {
-        "broadcaster",
-        "viewer",
-    }:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "role must be "
-                "broadcaster or viewer"
-            ),
-        )
-
-    # =====================================================
-    # CREATE PEER CONNECTION
-    # =====================================================
-
-    # -----------------------------------------------------
-    # BACKEND ICE
-    #
-    # Cloudflare TURN credentials are intentionally used by
-    # browser clients through /ice-servers.
-    #
-    # The Render/aiortc peer does NOT use Cloudflare TURN.
-    # This avoids the aioice TURN ChannelBind failure seen
-    # in production.
-    # -----------------------------------------------------
-
-    pc = RTCPeerConnection(
-        RTCConfiguration(
-            iceServers=[
-                RTCIceServer(
-                    urls="stun:stun.cloudflare.com:3478",
-                ),
-            ]
-        )
-    )
-
-    print(
-        "STREETGO BACKEND ICE: Cloudflare TURN disabled"
-    )
-
-    peers = get_live_peers(
-        offer.live_id
-    )
-
-    peers.setdefault(
-        offer.role,
-        set(),
-    ).add(
-        pc
-    )
-
-    print(
-        "========================================"
-    )
-
-    print(
-        "STREETGO WEBRTC CONNECTION CREATED"
-    )
-
-    print(
-        "LIVE ID:",
-        offer.live_id,
-    )
-
-    print(
-        "ROLE:",
-        offer.role,
-    )
-
-    print_peer_counts(
-        offer.live_id
-    )
-
-    print(
-        "========================================"
-    )
-
-    # =====================================================
-    # CONNECTION STATE
-    # =====================================================
-
-    @pc.on(
-        "connectionstatechange"
-    )
-    async def on_connectionstatechange():
-
-        print(
-            "STREETGO WEBRTC STATE:",
-            pc.connectionState,
-            "ROLE:",
-            offer.role,
-            "LIVE:",
-            offer.live_id,
-        )
-
-        # -------------------------------------------------
-        # IMPORTANT:
-        #
-        # disconnected is included.
-        #
-        # This prevents stale viewers from remaining in
-        # the viewer set after a browser disconnects.
-        # -------------------------------------------------
-
-        if pc.connectionState in {
-            "failed",
-            "closed",
-            "disconnected",
-        }:
-
-            await cleanup_peer(
-                offer.live_id,
-                offer.role,
-                pc,
-            )
-
-
-    # =====================================================
-    # ICE CONNECTION STATE
-    # =====================================================
-
-    @pc.on(
-        "iceconnectionstatechange"
-    )
-    async def on_iceconnectionstatechange():
-
-        print(
-            "STREETGO WEBRTC ICE:",
-            pc.iceConnectionState,
-            "ROLE:",
-            offer.role,
-            "LIVE:",
-            offer.live_id,
-        )
-
-        # -------------------------------------------------
-        # IMPORTANT:
-        #
-        # Handle disconnected as well as failed/closed.
-        # -------------------------------------------------
-
-        if pc.iceConnectionState in {
-            "failed",
-            "closed",
-            "disconnected",
-        }:
-
-            await cleanup_peer(
-                offer.live_id,
-                offer.role,
-                pc,
-            )
-
-
-    # =====================================================
-    # BROADCASTER TRACK HANDLER
-    # =====================================================
-
-    @pc.on("track")
-    def on_track(track):
-
-        print(
-            "========================================"
-        )
-
-        print(
-            "STREETGO WEBRTC TRACK RECEIVED"
-        )
-
-        print(
-            "LIVE:",
-            offer.live_id,
-        )
-
-        print(
-            "ROLE:",
-            offer.role,
-        )
-
-        print(
-            "TRACK:",
-            track.kind,
-        )
-
-        print(
-            "TRACK ID:",
-            track.id,
-        )
-
-        print(
-            "========================================"
-        )
-
-        # -------------------------------------------------
-        # Only broadcaster sends media.
-        # -------------------------------------------------
-
-        if offer.role != "broadcaster":
-
-            return
-
-        # -------------------------------------------------
-        # Create storage for this live.
-        # -------------------------------------------------
-
-        if (
-            offer.live_id
-            not in broadcast_tracks
-        ):
-
-            broadcast_tracks[
-                offer.live_id
-            ] = {}
-
-        # -------------------------------------------------
-        # VIDEO
-        # -------------------------------------------------
-        if track.kind == "video":
-
-            broadcast_tracks[
-                offer.live_id
-            ]["video"] = track
-
-            print(
-                "STREETGO VIDEO TRACK STORED:",
-                offer.live_id,
-                track.id,
-            )
-
-            async def verify_video_frames():
-
-                try:
-
-                    print(
-                        "STREETGO VIDEO FRAME TEST WAITING FOR CONNECTION:",
-                        offer.live_id,
-                        track.id,
-                        flush=True,
-                    )
-
-                    started = (
-                        asyncio.get_running_loop().time()
-                    )
-
-                    while pc.connectionState not in {
-                        "connected",
-                        "failed",
-                        "closed",
-                    }:
-
-                        elapsed = (
-                            asyncio.get_running_loop().time()
-                            - started
-                        )
-
-                        if elapsed >= 15.0:
-                            raise TimeoutError(
-                                "WebRTC connection did not reach connected state"
-                            )
-
-                        await asyncio.sleep(0.25)
-
-                    print(
-                        "STREETGO VIDEO FRAME TEST CONNECTION STATE:",
-                        pc.connectionState,
-                        "LIVE=",
-                        offer.live_id,
-                        "TRACK=",
-                        track.id,
-                        flush=True,
-                    )
-
-                    if pc.connectionState != "connected":
-                        raise RuntimeError(
-                            f"WebRTC connection state is {pc.connectionState}"
-                        )
-
-                    probe = relay.subscribe(
-                        track,
-                        buffered=False,
-                    )
-
-                    frame = await asyncio.wait_for(
-                        probe.recv(),
-                        timeout=10.0,
-                    )
-
-                    print(
-                        "========================================"
-                    )
-
-                    print(
-                        "STREETGO VIDEO FRAME RECEIVED"
-                    )
-
-                    print(
-                        "LIVE:",
-                        offer.live_id,
-                    )
-
-                    print(
-                        "TRACK:",
-                        track.id,
-                    )
-
-                    print(
-                        "FRAME:",
-                        type(frame).__name__,
-                    )
-
-                    print(
-                        "FRAME SIZE:",
-                        getattr(frame, "width", None),
-                        "x",
-                        getattr(frame, "height", None),
-                    )
-
-                    print(
-                        "========================================"
-                    )
-
-                except Exception as exc:
-
-                    print(
-                        "STREETGO VIDEO FRAME TEST FAILED:",
-                        "LIVE=",
-                        offer.live_id,
-                        "TRACK=",
-                        track.id,
-                        "ERROR_TYPE=",
-                        type(exc).__name__,
-                        "ERROR=",
-                        repr(exc),
-                        flush=True,
-                    )
-
-            asyncio.create_task(
-                verify_video_frames()
-            )
-
-
-        # -------------------------------------------------
-        # AUDIO
-        # -------------------------------------------------
-
-        elif track.kind == "audio":
-
-            broadcast_tracks[
-                offer.live_id
-            ]["audio"] = track
-
-            print(
-                "STREETGO AUDIO TRACK STORED:",
-                offer.live_id,
-                track.id,
-            )
-
-
-    # =====================================================
-    # SET REMOTE DESCRIPTION
-    # =====================================================
+    pc: RTCPeerConnection | None = None
 
     try:
+
+        # =================================================
+        # VALIDATION
+        # =================================================
+
+        if not offer.live_id:
+
+            raise HTTPException(
+                status_code=400,
+                detail="live_id is required",
+            )
+
+        if not offer.sdp:
+
+            raise HTTPException(
+                status_code=400,
+                detail="SDP is required",
+            )
+
+        if offer.type != "offer":
+
+            raise HTTPException(
+                status_code=400,
+                detail=
+                    "Expected WebRTC offer",
+            )
+
+        if offer.role not in {
+            "broadcaster",
+            "viewer",
+        }:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "role must be "
+                    "broadcaster or viewer"
+                ),
+            )
+
+        # =================================================
+        # CREATE BACKEND PEER CONNECTION
+        # =================================================
+
+        pc = RTCPeerConnection(
+            RTCConfiguration(
+                iceServers=[
+                    RTCIceServer(
+                        urls=
+                            "stun:stun.cloudflare.com:3478",
+                    ),
+                ],
+            )
+        )
+
+        print(
+            "STREETGO BACKEND ICE: Cloudflare TURN disabled",
+            flush=True,
+        )
+
+        # =================================================
+        # REGISTER PEER
+        # =================================================
+
+        peers = get_live_peers(
+            offer.live_id
+        )
+
+        peers.setdefault(
+            offer.role,
+            set(),
+        ).add(
+            pc
+        )
+
+        print(
+            "========================================",
+            flush=True,
+        )
+
+        print(
+            "STREETGO WEBRTC CONNECTION CREATED",
+            flush=True,
+        )
+
+        print(
+            "LIVE ID:",
+            offer.live_id,
+            flush=True,
+        )
+
+        print(
+            "ROLE:",
+            offer.role,
+            flush=True,
+        )
+
+        print_peer_counts(
+            offer.live_id
+        )
+
+        print(
+            "========================================",
+            flush=True,
+        )
+
+        # =================================================
+        # CONNECTION STATE
+        # =================================================
+
+        @pc.on(
+            "connectionstatechange"
+        )
+        async def on_connectionstatechange():
+
+            print(
+                "STREETGO WEBRTC STATE:",
+                pc.connectionState,
+                "ROLE:",
+                offer.role,
+                "LIVE:",
+                offer.live_id,
+                flush=True,
+            )
+
+            if pc.connectionState in {
+                "connected",
+                "connecting",
+            }:
+
+                cancel_disconnect_timer(
+                    pc
+                )
+
+                return
+
+            if (
+                pc.connectionState
+                == "disconnected"
+            ):
+
+                schedule_disconnect_cleanup(
+                    offer.live_id,
+                    offer.role,
+                    pc,
+                )
+
+                return
+
+            if pc.connectionState in {
+                "failed",
+                "closed",
+            }:
+
+                await cleanup_peer(
+                    offer.live_id,
+                    offer.role,
+                    pc,
+                )
+
+        # =================================================
+        # ICE CONNECTION STATE
+        # =================================================
+
+        @pc.on(
+            "iceconnectionstatechange"
+        )
+        async def on_iceconnectionstatechange():
+
+            print(
+                "STREETGO WEBRTC ICE:",
+                pc.iceConnectionState,
+                "ROLE:",
+                offer.role,
+                "LIVE:",
+                offer.live_id,
+                flush=True,
+            )
+
+            if pc.iceConnectionState in {
+                "connected",
+                "completed",
+            }:
+
+                cancel_disconnect_timer(
+                    pc
+                )
+
+                return
+
+            if (
+                pc.iceConnectionState
+                == "disconnected"
+            ):
+
+                schedule_disconnect_cleanup(
+                    offer.live_id,
+                    offer.role,
+                    pc,
+                )
+
+                return
+
+            if pc.iceConnectionState in {
+                "failed",
+                "closed",
+            }:
+
+                await cleanup_peer(
+                    offer.live_id,
+                    offer.role,
+                    pc,
+                )
+
+        # =================================================
+        # BROADCASTER TRACK HANDLER
+        # =================================================
+
+        @pc.on(
+            "track"
+        )
+        def on_track(
+            track
+        ):
+
+            print(
+                "========================================",
+                flush=True,
+            )
+
+            print(
+                "STREETGO WEBRTC TRACK RECEIVED",
+                flush=True,
+            )
+
+            print(
+                "LIVE:",
+                offer.live_id,
+                flush=True,
+            )
+
+            print(
+                "ROLE:",
+                offer.role,
+                flush=True,
+            )
+
+            print(
+                "TRACK:",
+                track.kind,
+                flush=True,
+            )
+
+            print(
+                "TRACK ID:",
+                track.id,
+                flush=True,
+            )
+
+            print(
+                "========================================",
+                flush=True,
+            )
+
+            if (
+                offer.role
+                != "broadcaster"
+            ):
+                return
+
+            broadcast_tracks.setdefault(
+                offer.live_id,
+                {}
+            )
+
+            if (
+                track.kind
+                == "video"
+            ):
+
+                broadcast_tracks[
+                    offer.live_id
+                ][
+                    "video"
+                ] = track
+
+                print(
+                    "STREETGO VIDEO TRACK STORED:",
+                    offer.live_id,
+                    track.id,
+                    flush=True,
+                )
+
+            elif (
+                track.kind
+                == "audio"
+            ):
+
+                broadcast_tracks[
+                    offer.live_id
+                ][
+                    "audio"
+                ] = track
+
+                print(
+                    "STREETGO AUDIO TRACK STORED:",
+                    offer.live_id,
+                    track.id,
+                    flush=True,
+                )
+
+        # =================================================
+        # SET REMOTE DESCRIPTION
+        # =================================================
 
         remote_description = (
             RTCSessionDescription(
@@ -939,27 +1079,34 @@ async def create_offer(
         # VIEWER
         # =================================================
 
-        if offer.role == "viewer":
+        if (
+            offer.role
+            == "viewer"
+        ):
 
             print(
-                "========================================"
+                "========================================",
+                flush=True,
             )
 
             print(
-                "STREETGO VIEWER WAITING FOR MEDIA"
+                "STREETGO VIEWER WAITING FOR MEDIA",
+                flush=True,
             )
 
             print(
                 "LIVE:",
                 offer.live_id,
+                flush=True,
             )
 
             print(
-                "========================================"
+                "========================================",
+                flush=True,
             )
 
             # ---------------------------------------------
-            # Wait for broadcaster video.
+            # Wait for broadcaster media.
             # ---------------------------------------------
 
             tracks = (
@@ -969,57 +1116,79 @@ async def create_offer(
                 )
             )
 
+            video_track = (
+                get_active_broadcast_track(
+                    offer.live_id,
+                    "video",
+                )
+            )
+
+            audio_track = (
+                get_active_broadcast_track(
+                    offer.live_id,
+                    "audio",
+                )
+            )
+
             print(
                 "STREETGO VIEWER TRACK CHECK:",
                 offer.live_id,
+                flush=True,
             )
 
             print(
                 "VIDEO:",
-                tracks.get("video") is not None,
+                video_track is not None,
+                flush=True,
             )
 
             print(
                 "AUDIO:",
-                tracks.get("audio") is not None,
+                audio_track is not None,
+                flush=True,
             )
 
             # ---------------------------------------------
-            # VIDEO
+            # Video is REQUIRED.
             # ---------------------------------------------
 
-            video_track = tracks.get(
-                "video"
-            )
+            if video_track is None:
 
-            if video_track is not None:
-
-                pc.addTrack(
-                    relay.subscribe(
-                        video_track,
-                        buffered=False,
-                    )
-                )
-
-                print(
-                    "STREETGO VIEWER VIDEO RELAY ATTACHED:",
+                await cleanup_peer(
                     offer.live_id,
+                    offer.role,
+                    pc,
                 )
 
-            else:
-
-                print(
-                    "STREETGO VIEWER VIDEO NOT AVAILABLE:",
-                    offer.live_id,
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Broadcaster video is not ready yet. "
+                        "Please retry."
+                    ),
                 )
 
             # ---------------------------------------------
-            # AUDIO
+            # Attach broadcaster video.
             # ---------------------------------------------
 
-            audio_track = tracks.get(
-                "audio"
+            pc.addTrack(
+                relay.subscribe(
+                    video_track,
+                    buffered=False,
+                )
             )
+
+            print(
+                "STREETGO VIEWER VIDEO RELAY ATTACHED:",
+                offer.live_id,
+                video_track.id,
+                flush=True,
+            )
+
+            # ---------------------------------------------
+            # Attach broadcaster audio if available.
+            # ---------------------------------------------
 
             if audio_track is not None:
 
@@ -1033,6 +1202,8 @@ async def create_offer(
                 print(
                     "STREETGO VIEWER AUDIO RELAY ATTACHED:",
                     offer.live_id,
+                    audio_track.id,
+                    flush=True,
                 )
 
             else:
@@ -1040,6 +1211,7 @@ async def create_offer(
                 print(
                     "STREETGO VIEWER AUDIO NOT AVAILABLE:",
                     offer.live_id,
+                    flush=True,
                 )
 
         # =================================================
@@ -1050,6 +1222,14 @@ async def create_offer(
 
         await pc.setLocalDescription(
             answer
+        )
+
+        # =================================================
+        # WAIT FOR BACKEND ICE
+        # =================================================
+
+        await wait_for_ice_gathering_complete(
+            pc
         )
 
         # =================================================
@@ -1073,38 +1253,155 @@ async def create_offer(
             )
 
         # =================================================
-        # ANSWER DEBUG
+        # VERIFY VIEWER ANSWER
+        # =================================================
+
+        if (
+            offer.role
+            == "viewer"
+        ):
+
+            answer_sdp = (
+                pc.localDescription.sdp
+            )
+
+            video_direction = (
+                get_media_direction(
+                    answer_sdp,
+                    "video",
+                )
+            )
+
+            audio_direction = (
+                get_media_direction(
+                    answer_sdp,
+                    "audio",
+                )
+            )
+
+            print(
+                "STREETGO VIEWER ANSWER MEDIA:",
+                {
+                    "video":
+                        video_direction,
+
+                    "audio":
+                        audio_direction,
+                },
+                flush=True,
+            )
+
+            # ---------------------------------------------
+            # Video must be server -> viewer.
+            # ---------------------------------------------
+
+            if video_direction not in {
+                "sendonly",
+                "sendrecv",
+            }:
+
+                print(
+                    "STREETGO INVALID VIEWER VIDEO DIRECTION:",
+                    video_direction,
+                    flush=True,
+                )
+
+                await cleanup_peer(
+                    offer.live_id,
+                    offer.role,
+                    pc,
+                )
+
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Viewer video negotiation failed. "
+                        "The server did not create an active "
+                        "video sending direction."
+                    ),
+                )
+
+            if (
+                video_direction
+                == "inactive"
+            ):
+
+                await cleanup_peer(
+                    offer.live_id,
+                    offer.role,
+                    pc,
+                )
+
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Viewer video negotiation is inactive. "
+                        "Please retry."
+                    ),
+                )
+
+        # =================================================
+        # DEBUG
         # =================================================
 
         print(
-            "========================================"
+            "========================================",
+            flush=True,
         )
 
         print(
-            "STREETGO WEBRTC ANSWER CREATED"
+            "STREETGO WEBRTC ANSWER CREATED",
+            flush=True,
         )
 
         print(
             "LIVE:",
             offer.live_id,
+            flush=True,
         )
 
         print(
             "ROLE:",
             offer.role,
+            flush=True,
         )
 
         print(
             "TYPE:",
             pc.localDescription.type,
+            flush=True,
         )
 
         print_peer_counts(
             offer.live_id
         )
 
+        if (
+            offer.role
+            == "viewer"
+        ):
+
+            print(
+                "VIDEO DIRECTION:",
+                get_media_direction(
+                    pc.localDescription.sdp,
+                    "video",
+                ),
+                flush=True,
+            )
+
+            print(
+                "AUDIO DIRECTION:",
+                get_media_direction(
+                    pc.localDescription.sdp,
+                    "audio",
+                ),
+                flush=True,
+            )
+
         print(
-            "========================================"
+            "========================================",
+            flush=True,
         )
 
         # =================================================
@@ -1112,7 +1409,8 @@ async def create_offer(
         # =================================================
 
         return {
-            "success": True,
+            "success":
+                True,
 
             "live_id":
                 offer.live_id,
@@ -1128,50 +1426,66 @@ async def create_offer(
         }
 
     except HTTPException:
-
         raise
 
     except Exception as exc:
 
         print(
-            "========================================"
+            "========================================",
+            flush=True,
         )
 
         print(
-            "STREETGO WEBRTC OFFER ERROR"
+            "STREETGO WEBRTC OFFER ERROR",
+            flush=True,
         )
 
         print(
             "LIVE:",
             offer.live_id,
+            flush=True,
         )
 
         print(
             "ROLE:",
             offer.role,
+            flush=True,
+        )
+
+        print(
+            "ERROR TYPE:",
+            type(exc).__name__,
+            flush=True,
         )
 
         print(
             "ERROR:",
             repr(exc),
+            flush=True,
         )
 
         print(
-            "========================================"
+            "========================================",
+            flush=True,
         )
 
-        # -------------------------------------------------
-        # CRITICAL:
-        #
-        # If offer creation fails after the peer was added
-        # to the active set, remove it immediately.
-        # -------------------------------------------------
+        if pc is not None:
 
-        await cleanup_peer(
-            offer.live_id,
-            offer.role,
-            pc,
-        )
+            try:
+
+                await cleanup_peer(
+                    offer.live_id,
+                    offer.role,
+                    pc,
+                )
+
+            except Exception as cleanup_exc:
+
+                print(
+                    "STREETGO WEBRTC FINAL CLEANUP ERROR:",
+                    repr(cleanup_exc),
+                    flush=True,
+                )
 
         raise HTTPException(
             status_code=500,
