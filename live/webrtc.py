@@ -1,5 +1,6 @@
 ﻿import asyncio
 import os
+import weakref
 import httpx
 
 from dotenv import load_dotenv
@@ -14,7 +15,7 @@ router=APIRouter(prefix="/live/webrtc",tags=["Live WebRTC"])
 relay=MediaRelay()
 peer_connections={}
 broadcast_tracks={}
-cleaned_peers=set()
+cleaned_peers = weakref.WeakSet()
 
 
 class WebRTCOffer(BaseModel):
